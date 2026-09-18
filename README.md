@@ -38,6 +38,22 @@ wf createsuperuser           # for /admin/
 DEBUG=on wf runserver        # DEBUG on only so runserver serves the admin's CSS
 ```
 
+To validate a deployment rather than just look at it, seed the *observations*
+and let the pipeline publish them:
+
+```sh
+wf seed_demo --observations       # fictional sightings, not networks
+wf aggregate                      # P9 tallies them, P1 publishes them
+wf export_dump --out /tmp/dump    # and they appear in the dump
+```
+
+Nothing exists after the first command but raw observations; the networks are
+created by the second. The seeded sightings are dated **9 and 10 days back**,
+and that is not arbitrary: P9 will not consume a UTC day until it is *closed*,
+8 days after it ends, which is what makes a day safe to count exactly once.
+Seed anything more recent and `aggregate` will correctly ignore it until the
+following week. `tests/test_commands.py` runs this same sequence.
+
 No configuration is needed for this: `ALLOWED_HOSTS` defaults to localhost, and
 the development signing key is accepted only while that is true. The moment
 `ALLOWED_HOSTS` names a real host, the service refuses to start without a
@@ -47,7 +63,10 @@ to set anything.
 `seed_demo` writes a handful of obviously fictional networks in two areas
 (Bologna and Lisbon) so that a website or an app has something to render. Every
 one of them has `Demo` in its name and a BSSID from the documentation range.
-`seed_demo --clear` takes them out again.
+`seed_demo --observations` writes the sightings behind them instead — three per
+network, from three fictional contributors across two closed UTC days, which is
+exactly what P1 asks for — and leaves `aggregate` to do the publishing.
+`seed_demo --clear` takes both out again.
 
 ### Tests
 

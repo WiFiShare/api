@@ -12,7 +12,7 @@ from django.test import TestCase
 from core.schemas import validate
 from ingest.models import IngestKey, RawObservation
 from networks.models import Network
-from networks.publish import aggregate, published_properties
+from networks.publish import _evidence, aggregate, published_properties
 from tests.helpers import batch, observation, seal_envelope, store_observation
 
 
@@ -113,6 +113,88 @@ class SeedDemoTest(TestCase):
 
         self.assertEqual(response.status_code, 200)
         validate("area", json.loads(response.content))
+
+
+class SeedObservationsEndToEndTest(TestCase):
+    """seed_demo --observations, aggregate, export_dump: the whole pipeline.
+
+    Every other test drives one stage with a clock of its own choosing. This
+    one runs the three commands an operator runs, on the wall clock, and
+    asserts a network reaches the dump by being *aggregated* into existence
+    rather than written there. It is the only test that fails if the storage,
+    the P9 close window, the P1 threshold and the exporter stop agreeing.
+    """
+
+    def test_seeded_observations_reach_the_dump_through_aggregation(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        call_command("seed_demo", "--observations", stdout=StringIO())
+
+        # The seed writes observations and nothing else: no network exists yet.
+        self.assertEqual(Network.objects.count(), 0)
+        self.assertEqual(RawObservation.objects.count(), 15)
+        self.assertTrue(all(row.consumed_at is None for row in RawObservation.objects.all()))
+
+        call_command("aggregate", stdout=StringIO())
+
+        networks = list(Network.objects.all())
+        self.assertEqual(len(networks), 5)
+        for network in networks:
+            with self.subTest(ssid=network.ssid):
+                self.assertIn("Demo", network.ssid)
+                self.assertTrue(network.is_published)
+                self.assertEqual(network.verification, Network.COMMUNITY)
+                # P9 tallied two closed days, which is exactly P1's threshold.
+                self.assertEqual(_evidence(network), (3, 3, 2))
+                self.assertEqual(network.day_tallies.count(), 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            call_command("export_dump", "--out", tmp, stdout=StringIO())
+
+            index = json.loads((Path(tmp) / "index.json").read_text())
+            validate("index", index)
+            self.assertEqual(index["network_count"], 5)
+            for cell5 in index["areas"]:
+                path = Path(tmp) / "areas" / cell5[:2] / cell5[:3] / f"{cell5}.geojson"
+                validate("area", json.loads(path.read_text()))
+            for path in Path(tmp).rglob("*.geojson"):
+                # P2, all the way through: no demo BSSID reaches the dump.
+                self.assertNotIn("00:00:5e:00:53", path.read_text())
+
+    def test_the_seeded_days_are_closed_whenever_this_runs(self) -> None:
+        """The seed is useless if its dates are not consumable today."""
+        call_command("seed_demo", "--observations", stdout=StringIO())
+
+        today = datetime.now(timezone.utc).date()
+        days = {
+            row.observed_at.astimezone(timezone.utc).date()
+            for row in RawObservation.objects.all()
+        }
+
+        self.assertEqual(len(days), 2)
+        for day in days:
+            self.assertGreaterEqual((today - day).days, 8)
+
+    def test_re_seeding_before_aggregation_replaces_rather_than_doubles(self) -> None:
+        call_command("seed_demo", "--observations", stdout=StringIO())
+        call_command("seed_demo", "--observations", stdout=StringIO())
+
+        self.assertEqual(RawObservation.objects.count(), 15)
+
+    def test_clear_takes_the_observations_too(self) -> None:
+        call_command("seed_demo", "--observations", stdout=StringIO())
+
+        call_command("seed_demo", "--clear", stdout=StringIO())
+
+        self.assertEqual(RawObservation.objects.count(), 0)
+
+    def test_the_default_mode_still_writes_networks_directly(self) -> None:
+        """The new mode is opt-in; nothing that depended on the old one moved."""
+        call_command("seed_demo", stdout=StringIO())
+
+        self.assertGreaterEqual(Network.objects.count(), 5)
+        self.assertEqual(RawObservation.objects.count(), 0)
 
 
 class EndToEndTest(TestCase):
