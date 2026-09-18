@@ -68,8 +68,11 @@ class RateLimitBucket(models.Model):
 class RawObservation(models.Model):
     """One observation out of a decrypted batch, pending aggregation.
 
-    Deleted seven days after the aggregation run that consumed it (P7). The
-    `bucket` column is what P1's "3 distinct rate-limit buckets" counts.
+    Deleted within 24 hours of the aggregation run that consumed it (P7),
+    and that run comes only once its UTC day is closed, 8 days on (P9). The
+    `bucket` column is what P9 counts, once per completed UTC day, into
+    `NetworkDayTally`; the value itself is never copied onto the network, and
+    P1 reads that tally rather than these rows, so the threshold outlives them.
     """
 
     ssid = models.CharField(max_length=32)

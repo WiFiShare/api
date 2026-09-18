@@ -5,7 +5,7 @@ Wi-Fi observations, area lookups, reports, opt-out and venue claims.
 
 Django 5 on Python 3.12. The contract it implements is the
 [spec](https://github.com/WiFiShare/spec) repository — the data model, the
-JSON Schemas, the privacy rules R1–R12 and P1–P8, and `openapi.yaml`. **If this
+JSON Schemas, the privacy rules R1–R12 and P1–P10, and `openapi.yaml`. **If this
 repository and `spec` disagree, `spec` is right**, and the disagreement is a bug
 here.
 
@@ -110,7 +110,9 @@ problem documents served as `application/problem+json`, carrying `type`,
 | A community network's position is the centre of its geohash-7 cell, not a measurement | `networks/publish.py:_apply_position` |
 | A network whose sightings span more than 1 km is marked mobile and excluded at any precision | `networks/publish.py`, P4 |
 | The opt-out list holds `HMAC-SHA256(BSSID)` under a server pepper, never the BSSID | `networks/publish.py:optout_hmac` |
-| Raw observations die 7 days after the run that consumed them; buckets and salts after 24 hours | `networks/publish.py:purge`, `manage.py purge` |
+| Raw observations die within 24 hours of the run that consumed them, and that run waits 8 days for their UTC day to close; buckets and salts die after 24 hours too | `networks/publish.py:purge`, `manage.py purge` |
+| P1's evidence outlives them as a count and never as a bucket value: one row per network per closed UTC day, holding only the day, the distinct-bucket count and the observation count | `networks/models.py:NetworkDayTally`, `networks/publish.py:_record_day`, P9 |
+| Rows older than 90 days collapse into one, so the record of which days a network was seen on does not accumulate; P1 reads sums, so its verdict is unchanged | `networks/publish.py:compact_tallies`, P10 |
 | Public ids are random, carry no derivation from BSSID, SSID or position, and are not reused | `networks/models.py:new_public_id` |
 | There is no BSSID lookup endpoint | `config/urls.py` — and `tests/test_read_api.py` asserts it |
 
@@ -133,7 +135,7 @@ the root logger captured.
 config/          settings, URLs, WSGI/ASGI, the DATABASE_URL parser
 core/            geohash, JSON Schema validation, RFC 9457 problem documents
 ingest/          keys, envelopes, filter rules R1-R12, rate limiting
-networks/        published networks, reports, opt-outs, claims, publish rules P1-P8
+networks/        published networks, reports, opt-outs, claims, publish rules P1-P10
 dump/            the public dump exporter
 schemas/         a verbatim copy of spec/schemas, so the service is self-contained
 tests/           the suite, including the two acceptance tests above

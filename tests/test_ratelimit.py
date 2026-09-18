@@ -14,7 +14,7 @@ from networks.publish import aggregate
 from tests.helpers import batch, make_key, publishable, seal_envelope
 
 ADDRESS = "203.0.113.47"
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
 
 
 class BucketTest(TestCase):

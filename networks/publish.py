@@ -1,9 +1,34 @@
-"""Publish rules P1-P8.
+"""Publish rules P1-P10.
 
 spec/privacy/publish-rules.md fixes both the rules and the order in which the
 aggregation job applies them:
 
-    opt-out (P5) -> mobile check (P4) -> threshold (P1) -> precision (P2/P3) -> write
+    consume a closed UTC day -> tally it (P9) -> opt-out (P5) -> mobile (P4)
+      -> threshold (P1) -> precision (P2/P3) -> write
+
+P9 is what lets P1 outlive P7. A UTC day is *closed* 8 days on, past the
+7-day window R7 lets a client upload within, so once a day is closed no
+observation belonging to it can still arrive. Aggregation consumes only closed
+days, and records on the network one row per day: the day, how many distinct
+rate-limit buckets were seen in it, and how many observations. The bucket
+values are not kept and are never compared across days -- the daily salt behind
+them is deleted within 24 hours, so a bucket is already day-scoped and
+"distinct buckets" has only ever meant distinct contributor-days. Summing the
+per-day counts therefore gives the same number as counting distinct buckets
+over the whole history, while keeping none of them. P1 reads that tally rather
+than the raw rows, so a network whose third contributor arrives months after
+the first two is still published, long after P7 has deleted the observations
+that proved the first two.
+
+Waiting for a day to close is what makes "tally it once" true rather than
+hopeful: a closed day is tallied once and is never revised, because there is
+nothing left that could revise it. The cost is latency, and the spec states it:
+a network first seen today is publishable nine days later at the earliest,
+eight for its first day to close and one more for P1's second day.
+
+P10 then compacts: tally rows older than 90 days collapse into one row holding
+the summed counts and the number of days. P1 reads sums, so its verdict does
+not change, and the record of *which* days a network was seen on goes.
 
 Two implementation choices the spec leaves open, recorded here because they
 are visible in the output:
@@ -13,10 +38,10 @@ are visible in the output:
   access point, so each observation is weighted `rssi + 101` (1 at -100 dBm,
   101 at 0 dBm), which is monotonic and never zero.
 * **Span.** P4 asks whether a network's observations span more than 1 km.
-  Raw observations are deleted after 7 days (P7), so the span is kept as a
-  cumulative bounding box on the network row and measured across its diagonal.
-  That is never smaller than the true maximum pairwise distance, so the check
-  errs towards not publishing.
+  Raw observations are deleted within a day of being consumed (P7), so the span
+  is kept as a cumulative bounding box on the network row and measured across
+  its diagonal. That is never smaller than the true maximum pairwise distance,
+  so the check errs towards not publishing.
 """
 
 from __future__ import annotations
@@ -24,23 +49,24 @@ from __future__ import annotations
 import hmac
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 from typing import Any, Iterable
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Min, Sum
 
 from core import geohash
 from ingest.models import RawObservation
-from networks.models import Network, NetworkBssid, OptOut, RetiredPublicId
+from networks.models import Network, NetworkBssid, NetworkDayTally, OptOut, RetiredPublicId
 
 EARTH_RADIUS_M = 6_371_000.0
 
 # P4: a network seen more than this far apart is a vehicle or a travel router.
 MOBILE_THRESHOLD_M = 1_000.0
 
-# P1: three observations, three buckets, two days.
+# P1: three observations, three buckets, two days, counted over the P9 tally.
 MIN_OBSERVATIONS = 3
 MIN_BUCKETS = 3
 MIN_DAYS = 2
@@ -49,9 +75,18 @@ MIN_DAYS = 2
 STALE_AFTER = timedelta(days=365)
 UNPUBLISH_REPORTS = 3
 
-# P7: raw observations live seven days past the run that consumed them.
-OBSERVATION_RETENTION = timedelta(days=7)
+# P7: raw observations live one day past the run that consumed them, and so
+# does every piece of rate-limit state.
+OBSERVATION_RETENTION = timedelta(hours=24)
 BUCKET_RETENTION = timedelta(hours=24)
+
+# P9: a UTC day is closed, and only then consumable, this long after its own
+# date. R7 lets a client upload an observation up to 7 days old, so by day 8
+# nothing belonging to that day can still arrive.
+CLOSED_AFTER = timedelta(days=8)
+
+# P10: tally rows older than this are compacted into one row per network.
+TALLY_COMPACT_AFTER = timedelta(days=90)
 
 COMMUNITY_CELL_LENGTH = 7
 AREA_CELL_LENGTH = 5
@@ -111,24 +146,28 @@ def _span_m(network: Network) -> float:
 
 
 def _evidence(network: Network) -> tuple[int, int, int]:
-    """P1's evidence, counted over the raw observations still retained.
+    """P1's evidence, read from the P9 day tally and not from the raw rows.
 
-    Returns (observations, distinct buckets, distinct UTC days). Because P7
-    deletes observations seven days after they are aggregated, this is a
-    rolling window: a network that collects its third contributor months after
-    the first two will not cross the threshold on the strength of the old
-    sighting. That is the conservative direction, and it is deliberate.
+    Returns (observations, distinct buckets, distinct UTC days). The counts
+    come from `NetworkDayTally`, which survives the purge of the observations
+    that produced it, so the threshold is cumulative over the network's whole
+    life: a third contributor arriving months after the first two still
+    publishes the network.
+
+    "Distinct buckets" is the sum of the per-day distinct-bucket counts. That
+    is the same number as counting distinct bucket values across the history,
+    because the daily salt makes the same contributor produce an unrelated
+    value on each day; and it needs none of the values to be kept.
+
+    Every figure is a sum, and days come from `day_count` rather than a row
+    count, so a P10-compacted row answers exactly as the rows it replaced did.
     """
-    bssids = list(network.bssids.values_list("bssid", flat=True))
-    rows = RawObservation.objects.filter(bssid__in=bssids).values_list("bucket", "observed_at")
-    buckets: set[str] = set()
-    days: set[date] = set()
-    total = 0
-    for bucket, observed_at in rows:
-        total += 1
-        buckets.add(bucket)
-        days.add(observed_at.astimezone(timezone.utc).date())
-    return total, len(buckets), len(days)
+    totals = network.day_tallies.aggregate(
+        observations=Sum("observation_count"),
+        buckets=Sum("bucket_count"),
+        days=Sum("day_count"),
+    )
+    return (totals["observations"] or 0, totals["buckets"] or 0, totals["days"] or 0)
 
 
 def _accumulate(network: Network, observations: Iterable[RawObservation]) -> None:
@@ -196,6 +235,9 @@ def evaluate_network(network: Network, *, now: datetime, result: AggregationResu
     if is_opted_out(network):  # P5
         network.is_published = False
         network.unpublished_reason = "opt-out"
+        # P5 takes the tally with everything else: an opted-out network keeps
+        # no evidence, so if it were ever allowed back it would start over.
+        network.day_tallies.all().delete()
         result.blocked_by_optout += 1
         result.note("P5")
     elif _span_m(network) > MOBILE_THRESHOLD_M:  # P4
@@ -226,11 +268,13 @@ def evaluate_network(network: Network, *, now: datetime, result: AggregationResu
                 network.is_published = True
                 network.unpublished_reason = ""
             elif network.is_published:
-                # Already over the threshold once; P1 is an entry gate, not a
-                # condition that a purge of old observations can revoke.
+                # P1 is an entry gate only: once a network is over the
+                # threshold no later run re-tests it, and only P5 or P6 take it
+                # out again. The spec does not say so either way; this is the
+                # reading, written down because it is a choice.
                 network.unpublished_reason = ""
             else:
-                observations, buckets, days = _evidence(network)  # P1
+                observations, buckets, days = _evidence(network)  # P1, over the P9 tally
                 if observations >= MIN_OBSERVATIONS and buckets >= MIN_BUCKETS and days >= MIN_DAYS:
                     network.is_published = True
                     network.unpublished_reason = ""
@@ -256,14 +300,48 @@ def _claim_position(network: Network) -> tuple[float, float] | None:
     return claim.venue_lat, claim.venue_lon
 
 
+def last_closed_day(now: datetime) -> date:
+    """P9: the newest UTC day that is closed, and so consumable, at `now`."""
+    return now.astimezone(timezone.utc).date() - CLOSED_AFTER
+
+
+def _closed_days_end(now: datetime) -> datetime:
+    """P9: the first instant aggregation must not reach.
+
+    Everything strictly earlier than this belongs to a day that is closed: at
+    least 8 days on from its own date, so past the 7 days R7 gives a client to
+    upload. Nothing belonging to such a day can still arrive, which is what
+    lets a day be tallied once and never revised.
+    """
+    return datetime.combine(
+        last_closed_day(now) + timedelta(days=1), time.min, tzinfo=timezone.utc
+    )
+
+
+def _record_day(network_id: int, day: date, buckets: int, observations: int) -> None:
+    """P9: record one closed UTC day on a network. Never the bucket values.
+
+    A closed day is tallied once and never revised. Finding a row already there
+    therefore means the day was recorded by an earlier run and there is nothing
+    to add: no observation for it can have arrived since.
+    """
+    NetworkDayTally.objects.get_or_create(
+        network_id=network_id,
+        day=day,
+        defaults={"bucket_count": buckets, "observation_count": observations, "day_count": 1},
+    )
+
+
 @transaction.atomic
 def aggregate(now: datetime | None = None) -> AggregationResult:
-    """One aggregation run: consume raw observations, then re-decide publication."""
+    """One aggregation run: consume completed UTC days, then re-decide publication."""
     now = now or datetime.now(timezone.utc)
     result = AggregationResult()
 
     pending = list(
-        RawObservation.objects.filter(consumed_at__isnull=True).order_by("bssid", "observed_at")
+        RawObservation.objects.filter(
+            consumed_at__isnull=True, observed_at__lt=_closed_days_end(now)
+        ).order_by("bssid", "observed_at")
     )
     touched: set[int] = set()
 
@@ -271,8 +349,16 @@ def aggregate(now: datetime | None = None) -> AggregationResult:
     for observation in pending:
         by_bssid.setdefault(observation.bssid, []).append(observation)
 
+    # P9, per network and per closed day: the distinct buckets seen in that day
+    # and how many observations they carried. The bucket values live here only
+    # for as long as the run, and are counted before being discarded.
+    days_seen: dict[int, dict[date, tuple[set[str], int]]] = {}
+
     for bssid, observations in by_bssid.items():
-        if OptOut.objects.filter(bssid_hmac=optout_hmac(bssid)).exists():  # P5, before storing
+        # P5 runs here, before anything is stored. That is earlier than the
+        # rule order puts it, and publish-rules.md says the difference is
+        # deliberate: an opted-out BSSID never reaches a network row at all.
+        if OptOut.objects.filter(bssid_hmac=optout_hmac(bssid)).exists():
             RawObservation.objects.filter(id__in=[o.id for o in observations]).delete()
             result.blocked_by_optout += 1
             continue
@@ -282,6 +368,17 @@ def aggregate(now: datetime | None = None) -> AggregationResult:
         network.save()
         touched.add(network.pk)
         result.observations_consumed += len(observations)
+
+        by_day = days_seen.setdefault(network.pk, {})
+        for observation in observations:
+            day = observation.observed_at.astimezone(timezone.utc).date()
+            buckets, count = by_day.get(day, (set(), 0))
+            buckets.add(observation.bucket)
+            by_day[day] = (buckets, count + 1)
+
+    for network_id, by_day in days_seen.items():
+        for day, (buckets, count) in by_day.items():
+            _record_day(network_id, day, len(buckets), count)
 
     RawObservation.objects.filter(id__in=[o.id for o in pending], consumed_at__isnull=True).update(
         consumed_at=now
@@ -310,8 +407,66 @@ def _network_for(bssid: str, sample: RawObservation) -> Network:
     return network
 
 
+@transaction.atomic
+def compact_tallies(now: datetime | None = None) -> int:
+    """P10: collapse tally rows older than 90 days into one row per network.
+
+    Atomic on purpose: the old rows are deleted before the summary that
+    replaces them is written, and half of that would lose P1's evidence.
+
+    The survivor carries the summed observation count, the summed bucket count
+    and the number of days it stands for, so P1's three figures are unchanged
+    to the unit. What goes is the day-by-day record of when a network was seen:
+    afterwards the row names only the earliest day it covers.
+
+    Returns how many rows were removed. A network already down to a single old
+    row is left alone, which makes running this twice a no-op.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = now.astimezone(timezone.utc).date() - TALLY_COMPACT_AFTER
+    removed = 0
+
+    network_ids = list(
+        NetworkDayTally.objects.filter(day__lt=cutoff)
+        .values_list("network_id", flat=True)
+        .distinct()
+    )
+    for network_id in network_ids:
+        rows = NetworkDayTally.objects.filter(network_id=network_id, day__lt=cutoff)
+        if rows.count() < 2:
+            continue
+        totals = rows.aggregate(
+            observations=Sum("observation_count"),
+            buckets=Sum("bucket_count"),
+            days=Sum("day_count"),
+            earliest=Min("day"),
+        )
+        deleted, _ = rows.delete()
+        NetworkDayTally.objects.create(
+            network_id=network_id,
+            day=totals["earliest"],
+            observation_count=totals["observations"],
+            bucket_count=totals["buckets"],
+            day_count=totals["days"],
+        )
+        removed += deleted - 1
+
+    return removed
+
+
 def purge(now: datetime | None = None) -> dict[str, int]:
-    """P7: delete consumed observations after 7 days, buckets after 24 hours."""
+    """P7 and P10: delete what is spent, compact what is old.
+
+    P7 takes consumed observations within 24 hours of the run that consumed
+    them, and the rate-limit counters and daily salt within 24 hours too. A raw
+    observation's whole life is therefore about nine days: eight waiting for
+    its UTC day to close under P9, and one after being consumed.
+
+    The P9 day tally is not raw data and is not deleted here, only compacted by
+    P10. It holds no bucket value, no position and no timestamp finer than a
+    date -- only "this many distinct contributors on this day" -- and P1 needs
+    it to keep meaning something once the observations behind it are gone.
+    """
     from ingest.models import RateLimitBucket, RateLimitSalt
 
     now = now or datetime.now(timezone.utc)
@@ -320,7 +475,13 @@ def purge(now: datetime | None = None) -> dict[str, int]:
     ).delete()
     buckets, _ = RateLimitBucket.objects.filter(window_start__lt=now - BUCKET_RETENTION).delete()
     salts, _ = RateLimitSalt.objects.filter(day__lt=now.date()).delete()
-    return {"observations": observations, "buckets": buckets, "salts": salts}
+    compacted = compact_tallies(now)  # P10
+    return {
+        "observations": observations,
+        "buckets": buckets,
+        "salts": salts,
+        "tally_rows": compacted,
+    }
 
 
 # --- Published representation ---------------------------------------------

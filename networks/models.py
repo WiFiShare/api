@@ -119,6 +119,54 @@ class Network(models.Model):
         self.save(update_fields=["is_published", "unpublished_reason", "updated_at"])
 
 
+class NetworkDayTally(models.Model):
+    """P9: what a network collected on one closed UTC day, and P10's compaction.
+
+    One row per (network, day), written when aggregation consumes that day's
+    observations. It holds the day, how many *distinct* rate-limit buckets were
+    seen for the network in it, and how many observations they carried. The
+    bucket values themselves are never written here, and are never compared
+    across days: the salt behind them rotates every UTC day and is deleted
+    within 24 hours (P7), so a bucket value is already day-scoped and "distinct
+    buckets" has only ever meant distinct contributor-days.
+
+    This is the evidence P1 reads. It is a count, not raw data, so it outlives
+    the observations behind it, which P7 deletes within a day of consuming
+    them. If it died with them, a network whose third contributor arrives later
+    could never reach the threshold; that is the bug P9 exists to fix. It does
+    die with the network under P5, along with everything else a network holds.
+
+    `day_count` is what P10 compaction leaves behind. A live row covers one day
+    and counts 1. Rows older than 90 days are collapsed into a single row whose
+    counts are the sums of theirs and whose `day_count` is how many days it
+    stands for; its `day` is then only the earliest day it covers, and which
+    days those were is gone. P1 reads sums, so its verdict does not change.
+    """
+
+    network = models.ForeignKey(Network, on_delete=models.CASCADE, related_name="day_tallies")
+    day = models.DateField()
+    bucket_count = models.PositiveIntegerField(default=0)
+    observation_count = models.PositiveIntegerField(default=0)
+    day_count = models.PositiveIntegerField(default=1)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["day"]
+        constraints = [
+            models.UniqueConstraint(fields=["network", "day"], name="unique_network_day")
+        ]
+
+    @property
+    def is_compacted(self) -> bool:
+        """P10: true once this row stands for more than the one day it names."""
+        return self.day_count > 1
+
+    def __str__(self) -> str:
+        if self.is_compacted:
+            return f"{self.day_count} days from {self.day}: {self.bucket_count} buckets"
+        return f"{self.day}: {self.bucket_count} buckets"
+
+
 class NetworkBssid(models.Model):
     """Which access points a network row stands for. Internal only for P2."""
 

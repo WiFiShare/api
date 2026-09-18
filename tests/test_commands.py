@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from io import StringIO
 
 from django.core.management import call_command
@@ -12,10 +12,8 @@ from django.test import TestCase
 from core.schemas import validate
 from ingest.models import IngestKey, RawObservation
 from networks.models import Network
-from networks.publish import published_properties
-from tests.helpers import batch, observation, publishable, seal_envelope
-
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+from networks.publish import aggregate, published_properties
+from tests.helpers import batch, observation, seal_envelope, store_observation
 
 
 class IssueIngestKeyTest(TestCase):
@@ -47,7 +45,14 @@ class IssueIngestKeyTest(TestCase):
 
 class AggregateCommandTest(TestCase):
     def test_reports_what_it_did(self) -> None:
-        publishable()
+        # The command reads the wall clock, so the fixture is dated against it:
+        # a UTC day is only consumable 8 days on (P9), so these are 9 and 10.
+        today = datetime.now(timezone.utc).date()
+        day_one = datetime.combine(today - timedelta(days=10), time(9), tzinfo=timezone.utc)
+        day_two = datetime.combine(today - timedelta(days=9), time(14), tzinfo=timezone.utc)
+        store_observation(bucket="bucket-a", observed_at=day_one)
+        store_observation(bucket="bucket-b", observed_at=day_two)
+        store_observation(bucket="bucket-c", observed_at=day_two)
         out = StringIO()
 
         call_command("aggregate", stdout=out)
@@ -57,6 +62,19 @@ class AggregateCommandTest(TestCase):
         self.assertIn("published 1", text)
         self.assertTrue(Network.objects.get().is_published)
         self.assertIsNotNone(RawObservation.objects.first().consumed_at)
+
+    def test_it_leaves_a_day_that_has_not_closed_alone(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        store_observation(
+            bucket="bucket-a",
+            observed_at=datetime.combine(today - timedelta(days=2), time(9), tzinfo=timezone.utc),
+        )
+        out = StringIO()
+
+        call_command("aggregate", stdout=out)
+
+        self.assertIn("consumed 0 observations", out.getvalue())
+        self.assertIsNone(RawObservation.objects.get().consumed_at)
 
 
 class SeedDemoTest(TestCase):
@@ -107,12 +125,20 @@ class EndToEndTest(TestCase):
         call_command("issue_ingest_key", "--key-id", "2026q4", stdout=StringIO())
         key = IngestKey.objects.get()
 
-        # Three contributors, two days: exactly what P1 asks for.
-        for index, (address, day, hour) in enumerate(
-            [("203.0.113.1", 16, 9), ("198.51.100.2", 17, 11), ("192.0.2.3", 17, 15)]
+        # Three contributors, two days: exactly what P1 asks for. The dates are
+        # relative to the wall clock because R7 refuses anything over 7 days
+        # old on the way in.
+        now = datetime.now(timezone.utc)
+        for index, (address, days_ago, hour) in enumerate(
+            [("203.0.113.1", 2, 9), ("198.51.100.2", 1, 11), ("192.0.2.3", 1, 15)]
         ):
+            observed = datetime.combine(
+                (now - timedelta(days=days_ago)).date(), time(hour), tzinfo=timezone.utc
+            )
             payload = batch(
-                observation(observed_at=f"2026-09-{day}T{hour:02d}:00:00Z", rssi=-55 - index)
+                observation(
+                    observed_at=observed.strftime("%Y-%m-%dT%H:00:00Z"), rssi=-55 - index
+                )
             )
             response = self.client.post(
                 "/v1/batches",
@@ -122,7 +148,10 @@ class EndToEndTest(TestCase):
             )
             self.assertEqual(response.status_code, 202)
 
-        call_command("aggregate", stdout=StringIO())
+        # R7 lets a client upload for 7 days and P9 waits 8 for the day to
+        # close, so nothing just ingested is ever consumable now. The command
+        # takes no clock, so this step calls what the command calls.
+        aggregate(now + timedelta(days=10))
 
         with tempfile.TemporaryDirectory() as tmp:
             call_command("export_dump", "--out", tmp, stdout=StringIO())

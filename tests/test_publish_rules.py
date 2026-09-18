@@ -1,25 +1,36 @@
-"""Publish rules P1-P8, one test class per rule."""
+"""Publish rules P1-P10, one test class per rule."""
 
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from django.test import TestCase
 
 from core import geohash
 from ingest.models import RawObservation
-from networks.models import Claim, Network, NetworkBssid, OptOut, Report, RetiredPublicId
+from networks.models import (
+    Claim,
+    Network,
+    NetworkBssid,
+    NetworkDayTally,
+    OptOut,
+    Report,
+    RetiredPublicId,
+)
 from networks.publish import (
     MOBILE_THRESHOLD_M,
+    _evidence,
     aggregate,
+    compact_tallies,
     optout_hmac,
     published_feature,
     published_properties,
+    purge,
 )
 from tests.helpers import publishable, store_observation
 
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
 BSSID = "b8:27:eb:11:22:33"
 
 
@@ -307,6 +318,320 @@ class P8PublicIdTest(TestCase):
         from networks.models import new_public_id
 
         self.assertNotEqual(new_public_id(), retired)
+
+
+class P9DayTallyTest(TestCase):
+    """P9: aggregation tallies closed UTC days, and P1 reads the tally.
+
+    A day is closed 8 days on, past the window R7 gives a client to upload, so
+    nothing belonging to it can still arrive and it is tallied once and never
+    revised. The tally holds a day, a count of distinct rate-limit buckets seen
+    in it and a count of observations. Never a bucket value, and never a
+    comparison of buckets across days: the daily salt is deleted within 24
+    hours, so a bucket is day-scoped by construction.
+
+    NOW is 2026-09-25, which is the first day the fixture's 09-16 and 09-17 are
+    both closed.
+    """
+
+    def _tally(self) -> list[tuple[date, int, int]]:
+        return [
+            (row.day, row.bucket_count, row.observation_count)
+            for row in NetworkDayTally.objects.order_by("day")
+        ]
+
+    def test_a_third_contributor_months_later_still_publishes(self) -> None:
+        """The bug P9 fixes: the evidence must outlive the observations.
+
+        Two contributors on two days, then P7 deletes the raw rows, then a
+        third contributor turns up three months on. Counting over the raw rows
+        this network could never be published, because the first two sightings
+        are gone by then. Counting over the tally, it is.
+        """
+        store_observation(
+            bucket="bucket-a", observed_at=datetime(2026, 9, 16, 9, tzinfo=timezone.utc)
+        )
+        store_observation(
+            bucket="bucket-b", observed_at=datetime(2026, 9, 17, 14, tzinfo=timezone.utc)
+        )
+        aggregate(NOW)
+        network = Network.objects.get()
+        self.assertFalse(network.is_published)
+
+        purge(NOW + timedelta(days=2))  # P7, a day after the run that consumed them
+        self.assertEqual(RawObservation.objects.count(), 0)
+        self.assertEqual(NetworkDayTally.objects.count(), 2)
+
+        store_observation(
+            bucket="bucket-c", observed_at=datetime(2026, 12, 16, 18, tzinfo=timezone.utc)
+        )
+        aggregate(datetime(2026, 12, 24, 12, tzinfo=timezone.utc))  # 12-16 closes on 12-24
+
+        network.refresh_from_db()
+        self.assertTrue(network.is_published)
+        self.assertEqual(network.unpublished_reason, "")
+        self.assertEqual(
+            self._tally(),
+            [
+                (date(2026, 9, 16), 1, 1),
+                (date(2026, 9, 17), 1, 1),
+                (date(2026, 12, 16), 1, 1),
+            ],
+        )
+
+    def test_a_day_is_counted_once_however_often_aggregation_runs(self) -> None:
+        publishable()
+        aggregate(NOW)
+        first = self._tally()
+        self.assertEqual(first, [(date(2026, 9, 16), 1, 1), (date(2026, 9, 17), 2, 2)])
+
+        for hours in (1, 2, 6, 24, 240):
+            aggregate(NOW + timedelta(hours=hours))
+
+        self.assertEqual(self._tally(), first)
+        self.assertEqual(NetworkDayTally.objects.count(), 2)
+        self.assertEqual(Network.objects.get().observation_count, 3)
+
+    def test_a_day_is_consumed_eight_days_on_and_not_a_moment_sooner(self) -> None:
+        """P9's boundary. R7 gives a client 7 days to upload; day 8 is safe."""
+        store_observation(
+            bucket="bucket-a", observed_at=datetime(2026, 9, 17, 9, tzinfo=timezone.utc)
+        )
+
+        aggregate(datetime(2026, 9, 24, 23, 59, tzinfo=timezone.utc))  # D+7, still open
+
+        self.assertEqual(NetworkDayTally.objects.count(), 0)
+        self.assertEqual(Network.objects.count(), 0)
+        self.assertIsNone(RawObservation.objects.get().consumed_at)
+
+        aggregate(datetime(2026, 9, 25, 0, 0, tzinfo=timezone.utc))  # D+8, closed
+
+        self.assertEqual(self._tally(), [(date(2026, 9, 17), 1, 1)])
+        self.assertIsNotNone(RawObservation.objects.get().consumed_at)
+
+    def test_a_day_still_open_cannot_complete_the_threshold(self) -> None:
+        store_observation(
+            bucket="bucket-a", observed_at=datetime(2026, 9, 16, 9, tzinfo=timezone.utc)
+        )
+        store_observation(
+            bucket="bucket-b", observed_at=datetime(2026, 9, 17, 14, tzinfo=timezone.utc)
+        )
+        store_observation(
+            bucket="bucket-c", observed_at=datetime(2026, 9, 18, 10, tzinfo=timezone.utc)
+        )
+
+        aggregate(NOW)  # 09-18 does not close until 09-26
+        self.assertFalse(Network.objects.get().is_published)
+
+        aggregate(datetime(2026, 9, 26, 0, 30, tzinfo=timezone.utc))
+        self.assertTrue(Network.objects.get().is_published)
+
+    def test_an_opt_out_takes_the_tally_with_everything_else(self) -> None:
+        """P5: an opted-out network keeps no evidence either."""
+        publishable()
+        aggregate(NOW)
+        self.assertEqual(NetworkDayTally.objects.count(), 2)
+
+        OptOut.objects.create(bssid_hmac=optout_hmac(BSSID))
+        aggregate(NOW + timedelta(hours=1))
+
+        network = Network.objects.get()
+        self.assertFalse(network.is_published)
+        self.assertEqual(network.unpublished_reason, "opt-out")
+        self.assertEqual(NetworkDayTally.objects.count(), 0)
+
+    def test_one_contributor_walking_past_never_reaches_three_buckets(self) -> None:
+        """Three sightings, two days, one bucket per day: two contributor-days."""
+        for day, hour in ((16, 9), (17, 11), (17, 15)):
+            store_observation(
+                bucket="same-bucket", observed_at=datetime(2026, 9, day, hour, tzinfo=timezone.utc)
+            )
+
+        aggregate(NOW)
+
+        network = Network.objects.get()
+        self.assertFalse(network.is_published)
+        self.assertEqual(network.unpublished_reason, "threshold")
+        self.assertEqual(self._tally(), [(date(2026, 9, 16), 1, 1), (date(2026, 9, 17), 1, 2)])
+
+    def test_a_contributor_day_is_the_finest_thing_the_tally_knows(self) -> None:
+        """Pinned because it looks like a hole and is in fact the design.
+
+        The salt rotates every UTC day and is deleted within 24 hours, so one
+        person seen on three days produces three unrelated bucket values. No
+        part of this system can tell that from three people, and P9 does not
+        try: publish-rules.md says "distinct buckets has only ever meant
+        distinct contributor-days". Three sightings on three days are three
+        contributor-days, whoever made them, and they publish.
+        """
+        for day in (15, 16, 17):
+            store_observation(
+                bucket=f"salt-of-{day}-then-thrown-away",
+                observed_at=datetime(2026, 9, day, 9, tzinfo=timezone.utc),
+            )
+
+        aggregate(NOW)
+
+        self.assertEqual(
+            self._tally(),
+            [(date(2026, 9, 15), 1, 1), (date(2026, 9, 16), 1, 1), (date(2026, 9, 17), 1, 1)],
+        )
+        self.assertTrue(Network.objects.get().is_published)
+
+    def test_the_tally_keeps_no_bucket_value(self) -> None:
+        """The negative test P9 exists for, in the shape of P2's."""
+        publishable()
+        aggregate(NOW)
+
+        stored = str(list(NetworkDayTally.objects.values()))
+
+        for bucket in ("bucket-a", "bucket-b", "bucket-c"):
+            self.assertNotIn(bucket, stored)
+        self.assertEqual(
+            sorted(NetworkDayTally.objects.values()[0]),
+            [
+                "bucket_count",
+                "created_at",
+                "day",
+                "day_count",
+                "id",
+                "network_id",
+                "observation_count",
+            ],
+        )
+
+    def test_two_bssids_of_one_network_share_its_days(self) -> None:
+        network = Network.objects.create(ssid="Test Open Net")
+        NetworkBssid.objects.create(network=network, bssid=BSSID)
+        NetworkBssid.objects.create(network=network, bssid="b8:27:eb:44:55:66")
+        store_observation(
+            bssid=BSSID,
+            bucket="bucket-a",
+            observed_at=datetime(2026, 9, 17, 9, tzinfo=timezone.utc),
+        )
+        store_observation(
+            bssid="b8:27:eb:44:55:66",
+            bucket="bucket-b",
+            observed_at=datetime(2026, 9, 17, 11, tzinfo=timezone.utc),
+        )
+
+        aggregate(NOW)
+
+        self.assertEqual(self._tally(), [(date(2026, 9, 17), 2, 2)])
+
+
+class P10CompactionTest(TestCase):
+    """P10: rows older than 90 days collapse, and P1 cannot tell the difference.
+
+    NOW is 2026-09-25, so the cutoff is 2026-06-27: the March days below are
+    well past it, and 09-16 is well inside it.
+    """
+
+    def _seen(self, day: date, buckets: list[str]) -> None:
+        for index, bucket in enumerate(buckets):
+            store_observation(
+                bucket=bucket,
+                observed_at=datetime.combine(day, time(9 + index), tzinfo=timezone.utc),
+            )
+
+    def test_p1_reads_the_same_three_figures_after_compaction(self) -> None:
+        self._seen(date(2026, 3, 1), ["bucket-a", "bucket-b"])
+        self._seen(date(2026, 3, 2), ["bucket-c"])
+        aggregate(NOW)
+        network = Network.objects.get()
+        self.assertTrue(network.is_published)
+        before = _evidence(network)
+        self.assertEqual(before, (3, 3, 2))
+
+        removed = compact_tallies(NOW)
+
+        self.assertEqual(removed, 1)
+        network.refresh_from_db()
+        self.assertEqual(_evidence(network), before)
+        row = NetworkDayTally.objects.get()
+        self.assertEqual(
+            (row.day, row.day_count, row.bucket_count, row.observation_count),
+            (date(2026, 3, 1), 2, 3, 3),
+        )
+        self.assertTrue(row.is_compacted)
+
+    def test_the_threshold_can_be_crossed_on_a_compacted_row_alone(self) -> None:
+        """The verdict, not just the figures: the gate opens on the summary."""
+        self._seen(date(2026, 3, 1), ["bucket-a", "bucket-b"])
+        self._seen(date(2026, 3, 2), ["bucket-c"])
+        aggregate(NOW)
+        compact_tallies(NOW)
+        self.assertEqual(NetworkDayTally.objects.count(), 1)
+
+        # Put the network back at the entry gate. One compacted row is all the
+        # evidence left, and it has to be enough.
+        network = Network.objects.get()
+        network.is_published = False
+        network.unpublished_reason = "threshold"
+        network.save()
+
+        aggregate(NOW + timedelta(hours=1))
+
+        self.assertTrue(Network.objects.get().is_published)
+
+    def test_a_network_still_short_of_the_threshold_stays_short_of_it(self) -> None:
+        self._seen(date(2026, 3, 1), ["bucket-a"])
+        self._seen(date(2026, 3, 2), ["bucket-b"])
+        aggregate(NOW)
+        network = Network.objects.get()
+        before = _evidence(network)
+        self.assertEqual(before, (2, 2, 2))
+
+        compact_tallies(NOW)
+
+        network.refresh_from_db()
+        self.assertEqual(_evidence(network), before)
+        self.assertFalse(network.is_published)
+        self.assertEqual(network.unpublished_reason, "threshold")
+
+    def test_only_rows_older_than_ninety_days_are_compacted(self) -> None:
+        self._seen(date(2026, 3, 1), ["bucket-a"])
+        self._seen(date(2026, 3, 2), ["bucket-b"])
+        self._seen(date(2026, 9, 16), ["bucket-c"])
+        aggregate(NOW)
+        self.assertEqual(NetworkDayTally.objects.count(), 3)
+
+        self.assertEqual(compact_tallies(NOW), 1)
+
+        self.assertEqual(
+            [(row.day, row.day_count) for row in NetworkDayTally.objects.order_by("day")],
+            [(date(2026, 3, 1), 2), (date(2026, 9, 16), 1)],
+        )
+        self.assertEqual(compact_tallies(NOW), 0)  # nothing left to collapse
+
+    def test_which_days_a_network_was_seen_on_is_what_goes(self) -> None:
+        for day in (date(2026, 3, 1), date(2026, 3, 5), date(2026, 3, 9)):
+            self._seen(day, [f"bucket-{day.isoformat()}"])
+        aggregate(NOW)
+
+        compact_tallies(NOW)
+
+        row = NetworkDayTally.objects.get()
+        self.assertEqual((row.day, row.day_count), (date(2026, 3, 1), 3))
+        self.assertFalse(NetworkDayTally.objects.filter(day=date(2026, 3, 5)).exists())
+        self.assertFalse(NetworkDayTally.objects.filter(day=date(2026, 3, 9)).exists())
+
+    def test_a_later_compaction_folds_in_the_rows_that_have_since_aged(self) -> None:
+        self._seen(date(2026, 3, 1), ["bucket-a"])
+        self._seen(date(2026, 3, 2), ["bucket-b"])
+        self._seen(date(2026, 9, 16), ["bucket-c"])
+        aggregate(NOW)
+        compact_tallies(NOW)
+
+        # Three months on, 09-16 is older than 90 days too.
+        self.assertEqual(compact_tallies(NOW + timedelta(days=100)), 1)
+
+        row = NetworkDayTally.objects.get()
+        self.assertEqual(
+            (row.day, row.day_count, row.bucket_count, row.observation_count),
+            (date(2026, 3, 1), 3, 3, 3),
+        )
+        self.assertEqual(_evidence(Network.objects.get()), (3, 3, 3))
 
 
 class OrderingTest(TestCase):

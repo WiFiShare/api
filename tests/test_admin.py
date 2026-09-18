@@ -12,7 +12,7 @@ from networks.models import Claim, Network, Report
 from networks.publish import aggregate
 from tests.helpers import publishable
 
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
 BSSID = "b8:27:eb:11:22:33"
 
 

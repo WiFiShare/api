@@ -6,7 +6,7 @@ from networks.publish import aggregate
 
 
 class Command(BaseCommand):
-    help = "Turn raw observations into published networks, applying P1-P8."
+    help = "Turn raw observations into published networks, applying P1-P10."
 
     def handle(self, *args: object, **options: object) -> None:
         result = aggregate()

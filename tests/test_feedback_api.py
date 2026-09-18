@@ -11,7 +11,7 @@ from networks.models import Claim, Network, NetworkBssid, OptOut, Report
 from networks.publish import aggregate, optout_hmac
 from tests.helpers import publishable
 
-NOW = datetime(2026, 9, 18, 12, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 25, 12, tzinfo=timezone.utc)
 BSSID = "b8:27:eb:11:22:33"
 
 
