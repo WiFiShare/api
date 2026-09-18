@@ -37,7 +37,9 @@ jobs:
         run: |
           uv run --python 3.12 python manage.py test tests.test_spec_sync tests.test_filter_fixtures \
             --verbosity 2 2>&1 | tee result.txt
-          if grep -qi "skipped" result.txt; then
+          # Django reports real skips as "OK (skipped=N)". Do not match on the
+          # word alone: it also prints "Skipping setup of unused database(s)".
+          if grep -qE "skipped=[0-9]+" result.txt; then
             echo "A spec test skipped. The spec checkout is missing or misconfigured."
             exit 1
           fi
