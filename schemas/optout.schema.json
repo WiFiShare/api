@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/optout.schema.json",
+  "title": "OptOut",
+  "description": "A request to remove a network and keep it out. Identify it by BSSID, which the app reads while connected, or by SSID plus geohash-5 cell from the website. Not cryptographically proven: removal is low risk, and an owner who wants back in can claim the network.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema"],
+  "anyOf": [{ "required": ["bssid"] }, { "required": ["ssid", "cell"] }],
+  "properties": {
+    "schema": { "const": "wifishare.optout/1" },
+    "bssid": { "type": "string", "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$" },
+    "ssid": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "cell": { "type": "string", "pattern": "^[0-9b-hjkmnp-z]{5}$" },
+    "reason": {
+      "enum": ["mine", "private", "wrong", "other"],
+      "description": "Optional and never required. No explanation is demanded of anyone opting out."
+    }
+  }
+}

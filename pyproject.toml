@@ -1,0 +1,29 @@
+[project]
+name = "wifishare-api"
+version = "0.1.0"
+description = "WiFiShare API: anonymous ingest, area lookups, reports, opt-out and venue claims."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "AGPL-3.0-or-later" }
+
+dependencies = [
+    # The web framework. Everything else is a plain Django view.
+    "django>=5.0,<6.0",
+    # Validates every request body and every generated area file against the
+    # JSON Schemas in the spec repo, so the spec stays the single source of truth.
+    "jsonschema>=4.21",
+    # HPKE (RFC 9180) base mode for envelope decryption. Maintained, and its own
+    # only dependency is `cryptography`.
+    "pyhpke>=0.6,<0.7",
+    # X25519 keygen, HMAC-SHA256 and the raw AEAD used by the RFC 9180 vector test.
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+# Only needed when DATABASE_URL points at Postgres. Tests run on SQLite.
+postgres = ["psycopg[binary]>=3.1"]
+# Only needed by the container image. `manage.py runserver` needs neither.
+server = ["gunicorn>=22.0"]
+
+[tool.uv]
+package = false

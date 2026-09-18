@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/envelope.schema.json",
+  "title": "Envelope",
+  "description": "What a client posts to /v1/batches. HPKE (RFC 9180) base mode, so that TLS-terminating proxies, CDNs and access logs never see a batch in the clear. info is the batch schema id; the key id is passed as additional authenticated data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "key_id", "suite", "enc", "ct"],
+  "properties": {
+    "schema": { "const": "wifishare.envelope/1" },
+    "key_id": {
+      "type": "string",
+      "pattern": "^[0-9]{4}q[1-4]$",
+      "description": "Which ingest key encrypted this envelope, for example 2026q4. Keys rotate quarterly and the previous key is accepted for 30 more days."
+    },
+    "suite": {
+      "const": "x25519-sha256-chacha20poly1305",
+      "description": "RFC 9180 KEM 0x0020, KDF 0x0001, AEAD 0x0003."
+    },
+    "enc": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "Encapsulated key, 32 bytes, base64url without padding."
+    },
+    "ct": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "maxLength": 262144,
+      "description": "Sealed batch, base64url without padding."
+    }
+  }
+}

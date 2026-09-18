@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/claim.schema.json",
+  "title": "Claim",
+  "description": "A venue says a network is theirs and chooses what to share. Proof is an SSID challenge: the owner appends the issued code to the SSID, and an app confirms seeing it. Publishing a claim puts the venue's exact position and BSSIDs in the open data, and the claim flow must say so before the owner confirms.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "ssid", "venue", "share"],
+  "properties": {
+    "schema": { "const": "wifishare.claim/1" },
+    "ssid": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "bssids": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$" },
+      "description": "Every access point the venue wants covered."
+    },
+    "venue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "kind": { "type": "string", "maxLength": 40 },
+        "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+        "lon": { "type": "number", "minimum": -180, "maximum": 180 }
+      }
+    },
+    "share": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["publish_credential"],
+      "properties": {
+        "publish_credential": {
+          "type": "boolean",
+          "description": "False means the network is listed but its password stays unpublished."
+        },
+        "credential": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type"],
+          "properties": {
+            "type": { "enum": ["wpa2-psk", "wpa3-psk", "portal", "none"] },
+            "secret": { "type": "string", "maxLength": 128 },
+            "note": { "type": "string", "maxLength": 200 }
+          }
+        }
+      }
+    },
+    "contact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["email"],
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254,
+          "description": "Used only to send the challenge code and to reach the owner about the claim. Never published."
+        }
+      }
+    }
+  }
+}

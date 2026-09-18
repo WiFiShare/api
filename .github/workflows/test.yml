@@ -1,0 +1,50 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The spec is the contract: the fixture and schema-sync tests are only
+      # meaningful when they run against the real spec repo, not the vendored
+      # copy. Checking it out here is what stops the copy drifting.
+      - uses: actions/checkout@v4
+        with:
+          repository: WiFiShare/spec
+          path: spec-checkout
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Run the suite against the spec
+        env:
+          WIFISHARE_SPEC_DIR: ${{ github.workspace }}/spec-checkout
+        run: uv run --python 3.12 python manage.py test --verbosity 2
+
+      - name: Refuse to ship with a skipped spec test
+        env:
+          WIFISHARE_SPEC_DIR: ${{ github.workspace }}/spec-checkout
+        run: |
+          uv run --python 3.12 python manage.py test tests.test_spec_sync tests.test_filter_fixtures \
+            --verbosity 2 2>&1 | tee result.txt
+          if grep -qi "skipped" result.txt; then
+            echo "A spec test skipped. The spec checkout is missing or misconfigured."
+            exit 1
+          fi
+
+      - name: Django deployment checks
+        env:
+          SECRET_KEY: ci-only-not-a-real-secret
+          ALLOWED_HOSTS: api.example.com
+          DEBUG: "0"
+        run: uv run --python 3.12 python manage.py check --deploy --fail-level ERROR

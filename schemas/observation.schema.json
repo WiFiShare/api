@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/observation.schema.json",
+  "title": "Observation",
+  "description": "One sighting of one shareable network, after the filter rules in privacy/filter-rules.md have been applied on the device.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ssid", "bssid", "security", "lat", "lon", "accuracy_m", "rssi", "observed_at", "source"],
+  "properties": {
+    "ssid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "description": "Network name as broadcast. Hidden or empty SSIDs are dropped by R1."
+    },
+    "bssid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}(:[0-9a-f]{2}){5}$",
+      "description": "Lowercase colon-separated MAC address (R9). Locally administered addresses are dropped by R3."
+    },
+    "security": {
+      "enum": ["open", "owe"],
+      "description": "Phase 1 collects only networks that anyone may join (R5)."
+    },
+    "captive_portal": {
+      "enum": ["unknown", "detected", "none"],
+      "default": "unknown",
+      "description": "Set to detected only when the device actually met a portal."
+    },
+    "lat": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90,
+      "description": "Device position, rounded to 4 decimal places (R10). Not expressed as multipleOf: binary floating point makes that unreliable. The server checks the rounding with a 1e-9 tolerance instead."
+    },
+    "lon": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180,
+      "description": "Device position, rounded to 4 decimal places (R10). Not expressed as multipleOf: binary floating point makes that unreliable. The server checks the rounding with a 1e-9 tolerance instead."
+    },
+    "accuracy_m": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 50,
+      "description": "Reported accuracy of the device's own fix. Worse than 50 m is dropped by R6."
+    },
+    "rssi": {
+      "type": "integer",
+      "minimum": -100,
+      "maximum": 0,
+      "description": "Signal strength in dBm, used to weight the position estimate."
+    },
+    "frequency_mhz": {
+      "type": "integer",
+      "minimum": 2400,
+      "maximum": 7125,
+      "description": "Channel centre frequency, when the platform reports it."
+    },
+    "observed_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$",
+      "description": "UTC, truncated to the hour (R11)."
+    },
+    "source": {
+      "enum": ["scan", "connected"],
+      "description": "connected means the device was joined to this network. iOS can only report connected."
+    }
+  }
+}

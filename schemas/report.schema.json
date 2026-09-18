@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/report.schema.json",
+  "title": "Report",
+  "description": "A user's verdict on a published network. Anonymous and rate-limited. Three private or gone reports unpublish the network (P6).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "kind"],
+  "properties": {
+    "schema": { "const": "wifishare.report/1" },
+    "kind": {
+      "enum": ["works", "fails", "not_free", "private", "gone"],
+      "description": "not_free: it demanded payment. private: it is somebody's home or closed network. gone: no longer there."
+    },
+    "note": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Optional free text shown only to moderators. Clients must warn that it is read by people."
+    }
+  }
+}

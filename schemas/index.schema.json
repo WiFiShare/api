@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wifishare.github.io/spec/schemas/index.schema.json",
+  "title": "Dump index",
+  "description": "index.json at the root of the dump and of the API's static mirror. It lists which area files exist, so a client can fetch one document instead of probing for files that are not there. Counts are a convenience for humans: a client must not assume an area is empty because a count says zero.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated", "network_count", "area_count", "areas"],
+  "properties": {
+    "schema": { "const": "wifishare.index/1" },
+    "generated": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "Date of the export that wrote this file, or null when nothing has been published yet."
+    },
+    "network_count": { "type": "integer", "minimum": 0 },
+    "area_count": { "type": "integer", "minimum": 0 },
+    "areas": {
+      "type": "object",
+      "description": "One entry per geohash-5 area that has a file. The key is the area, and the path of its file follows the rule in docs/geohash.md.",
+      "propertyNames": { "pattern": "^[0-9b-hjkmnp-z]{5}$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["network_count"],
+        "properties": {
+          "network_count": { "type": "integer", "minimum": 0 },
+          "updated": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "description": "Date this area file last changed. Optional, so a client must not require it."
+          }
+        }
+      }
+    }
+  }
+}

@@ -87,3 +87,24 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# --- WiFiShare ------------------------------------------------------------
+
+# Local database and any exported dump.
+*.sqlite3
+/dump-out/
+/staticfiles/
+
+# uv's virtualenv. uv.lock IS committed: it pins the dependency set.
+.venv/
+
+# Real environment files. .env.example is committed; .env is not.
+.env
+.env.*
+!.env.example
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
